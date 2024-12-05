@@ -1,0 +1,963 @@
+---
+title: "Time-Series Models"
+output: html_document
+date: "2024-12-03"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r}
+# Install required packages
+install.packages("tidyverse")
+install.packages("readr")
+install.packages("ggplot2")
+install.packages("xgboost")
+install.packages("forecast")
+install.packages("tseries")
+install.packages("caret")
+install.packages("Metrics")
+install.packages("zoo")
+install.packages("lubridate")
+install.packages("dplyr")
+```
+
+```{r}
+library(tidyverse)
+library(readr)
+library(ggplot2)
+library(xgboost)
+library(forecast)
+library(tseries)
+library(caret)
+library(Metrics)
+library(zoo)
+library(lubridate)
+library(dplyr)
+```
+
+Read file from link
+
+```{r}
+# Download the dataset from GitHub
+url <- "https://raw.githubusercontent.com/fongbubble/UoB_MGRCM0034_Car_Sales/main/car_sales.csv"
+csv_file_path <- tempfile(fileext = ".csv")
+download.file(url, destfile = csv_file_path)
+print(paste("CSV File Path:", csv_file_path))
+
+# Read the CSV file
+car_sales_data <- read_csv(csv_file_path)
+head(car_sales_data, 5)
+```
+
+Clean and transform data.
+
+```{r}
+# Get distinct car models
+distinct_models <- unique(car_sales_data$Model)
+
+# View the result
+print(distinct_models)
+```
+
+
+
+```{r}
+# Update specific values in car_sales_data$Model
+car_sales_data$Model[car_sales_data$Model == "5-Sep"] <- "9-5"
+car_sales_data$Model[car_sales_data$Model == "3-Sep"] <- "9-3"
+
+# View the updated data
+print(car_sales_data)
+```
+
+
+```{r}
+# Convert 'Date' column to Date type with the correct format (month/day/year)
+car_sales_data$Date <- as.Date(car_sales_data$Date, format = "%m/%d/%Y")
+
+# Aggregate data to daily totals
+library(dplyr)
+daily_sales <- car_sales_data %>%
+  group_by(Date) %>%
+  summarise(quantity = n())
+
+# Create a sequence of all dates from the minimum to the maximum
+all_dates <- seq(min(daily_sales$Date, na.rm = TRUE), max(daily_sales$Date, na.rm = TRUE), by = "day")
+
+# Create a complete dataframe with all dates
+all_dates_df <- data.frame(Date = all_dates)
+
+# Join with daily_sales to fill missing dates with 0 sales
+daily_sales <- all_dates_df %>%
+  left_join(daily_sales, by = "Date") %>%
+  mutate(quantity = ifelse(is.na(quantity), 0, quantity))
+
+# View the result
+print(head(daily_sales))
+```
+```{r}
+# Create time-series features
+library(dplyr)
+library(zoo)
+
+daily_sales <- daily_sales %>%
+  mutate(
+    day = day(Date),
+    month = month(Date),
+    year = year(Date),
+    day_of_week = wday(Date) - 1, # Adjust for 0-based indexing
+    week_of_year = isoweek(Date),
+    lag_1 = lag(quantity, 1),
+    lag_2 = lag(quantity, 2),
+    lag_3 = lag(quantity, 3),
+    lag_4 = lag(quantity, 4),
+    lag_5 = lag(quantity, 5),
+    lag_6 = lag(quantity, 6),
+    lag_7 = lag(quantity, 7),
+    mav_7 = rollapply(lag(quantity, 1), 7, mean, fill = NA, align = "right"),
+    mstd_7 = rollapply(lag(quantity, 1), 7, sd, fill = NA, align = "right")
+  )
+
+# Drop rows with missing values caused by lagged features
+daily_sales <- na.omit(daily_sales)
+
+# Define features (X) and target variable (y)
+X <- daily_sales %>%
+  select(day, month, year, day_of_week, week_of_year, lag_1, lag_2, lag_3, lag_4, lag_5, lag_6, lag_7, mav_7, mstd_7)
+
+y <- daily_sales$quantity
+
+# Verify the structure of the updated data
+str(X)
+str(y)
+
+```
+```{r}
+# Split into training (80%) and testing (20%)
+set.seed(42)
+cutoff_index <- floor(0.8 * nrow(X))
+
+# Splitting features (X) into training and testing
+X_train <- X[1:cutoff_index, ]
+X_test <- X[(cutoff_index + 1):nrow(X), ]
+
+# Splitting target variable (y) into training and testing
+y_train <- y[1:cutoff_index]
+y_test <- y[(cutoff_index + 1):length(y)]
+
+# Convert data to matrix format for XGBoost
+library(xgboost)
+dtrain <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+dtest <- xgb.DMatrix(data = as.matrix(X_test), label = y_test)
+
+# Verify the shapes
+print(dim(X_train))  # Should match the number of training rows and columns in X
+print(dim(X_test))   # Should match the number of testing rows and columns in X
+print(length(y_train)) # Should match the number of rows in X_train
+print(length(y_test))  # Should match the number of rows in X_test
+```
+
+```{r}
+# Hyperparameter grid
+param_grid <- list(
+  nrounds = c(100, 200),
+  max_depth = c(5, 7, 9),
+  learning_rate = c(0.01, 0.1),
+  subsample = c(0.8, 1),
+  colsample_bytree = c(0.3, 0.7, 1),
+  gamma = c(0, 1),
+  min_child_weight = c(1, 3, 5)
+)
+```
+
+```{r}
+# Cross-validation and hyperparameter tuning
+best_rmse <- Inf
+best_model <- NULL
+best_params <- list()
+
+for (max_depth in param_grid$max_depth) {
+  for (learning_rate in param_grid$learning_rate) {
+    for (subsample in param_grid$subsample) {
+      for (colsample_bytree in param_grid$colsample_bytree) {
+        for (gamma in param_grid$gamma) {
+          
+          params <- list(
+            objective = "reg:squarederror",
+            eval_metric = "rmse",
+            max_depth = max_depth,
+            eta = learning_rate,
+            subsample = subsample,
+            colsample_bytree = colsample_bytree,
+            gamma = gamma
+          )
+          
+          # Train the model
+          model <- xgb.train(
+            params = params,
+            data = dtrain,
+            nrounds = 100
+          )
+          
+          # Make predictions
+          preds <- predict(model, dtest)
+          
+          # Compute RMSE
+          rmse <- sqrt(mean((preds - y_test)^2))
+          
+          # Update best model if current RMSE is better
+          if (rmse < best_rmse) {
+            best_rmse <- rmse
+            best_model <- model
+            best_params <- params
+          }
+        }
+      }
+    }
+  }
+}
+
+```
+
+```{r}
+# Evaluate the final model
+preds <- predict(best_model, dtest)
+mse <- mean((preds - y_test)^2)
+rmse <- sqrt(mse)
+mae <- mean(abs(preds - y_test))
+
+cat("Final Model Metrics:\n")
+cat(sprintf("  Mean Squared Error (MSE): %.4f\n", mse))
+cat(sprintf("  Root Mean Squared Error (RMSE): %.4f\n", rmse))
+cat(sprintf("  Mean Absolute Error (MAE): %.4f\n", mae))
+```
+```{r}
+library(ggplot2)
+
+# Ensure `test_dates` is of Date type
+test_dates <- daily_sales[(cutoff_index + 1):nrow(X), ]$Date
+
+# Combine data into a single data frame for better handling
+data <- data.frame(
+  Date = test_dates,
+  Quantity = c(y_test, preds),
+  Type = rep(c("Actual", "Predicted"), each = length(y_test))
+)
+
+# Plot
+ggplot(data, aes(x = Date, y = Quantity, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  labs(
+    title = "XGBoost - Actual vs. Predicted Sales Quantity",
+    x = "Date",
+    y = "Total Sales Quantity",  # Updated y-axis label
+    color = "Type of Data",
+    linetype = "Type of Data"
+  ) +
+  scale_x_date(
+    date_labels = "%Y-%m",  # Format as Year-Month
+    date_breaks = "1 month" # Show one tick per month
+  ) +
+  scale_color_manual(values = c("Actual" = "blue", "Predicted" = "red")) +
+  scale_linetype_manual(values = c("Actual" = "solid", "Predicted" = "dashed")) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1) # Rotate x-axis labels for better readability
+  )
+```
+
+
+Predict next 3 months sales quantity
+```{r}
+# Predict Next 3 months sales
+dfull <- xgb.DMatrix(data = as.matrix(X), label = y)
+final_model <- xgb.train(
+  params = best_params,  # Use the best parameters from hyperparameter tuning
+  data = dfull,
+  nrounds = 100  # Same as used during hyperparameter tuning
+)
+
+# Create a new dataframe with features for the Next 3 months
+next_three_months_data <- tail(daily_sales, 7)
+rolling_sales_list <- tail(daily_sales$quantity, 7)
+
+# Determine features to use
+features <- c('day', 'month', 'year', 'day_of_week', 'week_of_year', 'lag_1', 'lag_2', 'lag_3', 'lag_4', 'lag_5', 'lag_6', 'lag_7', 'mav_7', 'mstd_7')
+col_names_order <- c('date', 'quantity', 'day', 'month', 'year', 'day_of_week', 'week_of_year', 'lag_1', 'lag_2', 'lag_3', 'lag_4', 'lag_5', 'lag_6', 'lag_7', 'mav_7', 'mstd_7')
+
+# Set the date to next day and then loop to create the Next 3 months
+for (i in 1:90) {  # Predicting for the next 90 days
+  next_date <- max(next_three_months_data$Date) + 1  # Add one day
+  new_row <- data.frame(Date = next_date)
+  new_row$day <- as.numeric(format(new_row$Date, "%d"))
+  new_row$month <- as.numeric(format(new_row$Date, "%m"))
+  new_row$year <- as.numeric(format(new_row$Date, "%Y"))
+  new_row$day_of_week <- as.numeric(format(new_row$Date, "%w"))
+  new_row$week_of_year <- as.numeric(format(new_row$Date, "%U"))
+
+  # Update lagged features based on previous predictions
+  for (lag in 1:7) {
+    new_row[[paste0("lag_", lag)]] <- rolling_sales_list[length(rolling_sales_list) - lag + 1]
+  }
+
+  # Calculate moving value
+  new_row$mav_7 <- mean(tail(rolling_sales_list, 7))
+  new_row$mstd_7 <- sd(tail(rolling_sales_list, 7))
+  
+  # Convert the new_row to matrix format for prediction
+  new_row_matrix <- xgb.DMatrix(data = as.matrix(new_row[features]))
+
+  # Predict the quantity using the final model
+  new_quantity <- predict(final_model, new_row_matrix)
+
+  # Append the predicted quantity to the Next 3 months DataFrame
+  new_row$quantity <- new_quantity
+  next_three_months_data <- rbind(next_three_months_data, new_row)
+  rolling_sales_list <- c(rolling_sales_list, new_quantity)
+}
+
+print(next_three_months_data)
+```
+```{r}
+library(ggplot2)
+
+# Combine historical data and predicted data
+combined_data <- rbind(
+  data.frame(Date = daily_sales$Date, quantity = daily_sales$quantity, Type = "Historical"), # Historical data with 'Type' column
+  data.frame(Date = next_three_months_data$Date, quantity = next_three_months_data$quantity, Type = "Forecasted") # Predicted data with 'Type' column
+)
+
+# Plot historical and predicted sales
+ggplot(combined_data, aes(x = Date, y = quantity, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  labs(
+    title = "XGBoost - Daily Car Sales Quantity Prediction for Next 3 Months",
+    x = "Date",
+    y = "Total Sales Quantity",
+    color = "Type of Data",
+    linetype = "Type of Data"
+  ) +
+  scale_x_date(
+    date_labels = "%Y-%m", # Format as Year-Month
+    date_breaks = "1 month" # Show one tick per month
+  ) +
+  scale_color_manual(values = c("Historical" = "blue", "Forecasted" = "red")) +
+  scale_linetype_manual(values = c("Historical" = "solid", "Forecasted" = "dashed")) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1) # Rotate x-axis labels for better readability
+  )
+```
+
+
+```{r}
+library(ggplot2)
+
+# Define the start and end dates for the x-axis
+start_date <- as.Date("2023-09-01")
+end_date <- as.Date("2024-03-31")
+
+# Combine historical data and predicted data
+combined_data <- rbind(
+  data.frame(Date = daily_sales$Date, quantity = daily_sales$quantity, Type = "Historical"), # Historical data with 'Type' column
+  data.frame(Date = next_three_months_data$Date, quantity = next_three_months_data$quantity, Type = "Forecasted") # Predicted data with 'Type' column
+)
+
+# Plot historical and predicted sales with limited x-axis range
+ggplot(combined_data, aes(x = Date, y = quantity, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  labs(
+    title = "XGBoost - Daily Car Sales Quantity Prediction for Next 3 Months",
+    x = "Date",
+    y = "Total Sales Quantity",
+    color = "Type of Data",
+    linetype = "Type of Data"
+  ) +
+  scale_x_date(
+    date_labels = "%b-%Y",  # Format as Month-Year (e.g., Sep-2023)
+    date_breaks = "1 month", # Show one tick per month
+    limits = c(start_date, end_date)  # Limit the x-axis range from Sep 2023 to Mar 2024
+  ) +
+  scale_color_manual(values = c("Historical" = "blue", "Forecasted" = "red")) +
+  scale_linetype_manual(values = c("Historical" = "solid", "Forecasted" = "dashed")) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1) # Rotate x-axis labels for better readability
+  )
+```
+
+
+# Linear Regression
+
+```{r}
+# Convert the target variable (y_train) into a data frame
+train_frame <- cbind(X_train, quantity = y_train)
+colnames(train_frame)[colnames(train_frame) == "y_train"] <- "quantity"
+
+# Train the Linear Regression Model
+lr_model <- lm(quantity ~ day + month + year + day_of_week + week_of_year + lag_1 + lag_2 + lag_3 + lag_4 + lag_5 + lag_6 + lag_7 + mav_7 + mstd_7, 
+               data = train_frame)
+
+# Evaluate the final model
+preds <- predict(lr_model, X_test)
+mse <- mean((preds - y_test)^2)
+rmse <- sqrt(mse)
+mae <- mean(abs(preds - y_test))
+
+cat("Final Model Metrics:\n")
+cat(sprintf("  Mean Squared Error (MSE): %.4f\n", mse))
+cat(sprintf("  Root Mean Squared Error (RMSE): %.4f\n", rmse))
+cat(sprintf("  Mean Absolute Error (MAE): %.4f\n", mae))
+
+# Summary of the trained model
+summary(lr_model)
+```
+Plot test vs predicted
+
+```{r}
+library(ggplot2)
+
+test_dates <- daily_sales[(cutoff_index + 1):nrow(X), ]$Date
+
+# Combine historical data and predicted data
+combined_data <- rbind(
+  data.frame(Date = test_dates, quantity = y_test, Type = "Actual"), # Actual data with 'Type' column
+  data.frame(Date = test_dates, quantity = preds, Type = "Predicted") # Predicted data with 'Type' column
+)
+
+# Plot historical and predicted sales
+ggplot(combined_data, aes(x = Date, y = quantity, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Linear Regression - Actual vs. Predicted Sales Quantity",
+    x = "Date",
+    y = "Total Sales Quantity",
+    color = "Type of Data",
+    linetype = "Type of Data"
+  ) +
+  scale_x_date(
+    date_labels = "%Y-%m", # Format as Year-Month
+    date_breaks = "1 month" # Show one tick per month
+  ) +
+  scale_color_manual(values = c("Actual" = "#83c5be", "Predicted" = "#fb8500")) +
+  scale_linetype_manual(values = c("Actual" = "solid", "Predicted" = "dashed")) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1) # Rotate x-axis labels for better readability
+  )
+```
+
+
+Make Prediction
+
+```{r}
+# Predict Next 3 months sales
+train_frame <- cbind(X, quantity = y)
+colnames(train_frame)[colnames(train_frame) == "y"] <- "quantity"
+
+# Train the Linear Regression Model
+final_model <- lm(quantity ~ day + month + year + day_of_week + week_of_year + lag_1 + lag_2 + lag_3 + lag_4 + lag_5 + lag_6 + lag_7 + mav_7 + mstd_7, 
+                  data = train_frame)
+
+# Create a new dataframe with features for the Next 3 months
+next_three_months_data <- tail(daily_sales, 7)
+rolling_sales_list <- tail(daily_sales$quantity, 7)
+
+# Determine features to use
+features <- c('day', 'month', 'year', 'day_of_week', 'week_of_year', 'lag_1', 'lag_2', 'lag_3', 'lag_4', 'lag_5', 'lag_6', 'lag_7', 'mav_7', 'mstd_7')
+col_names_order <- c('date', 'quantity', 'day', 'month', 'year', 'day_of_week', 'week_of_year', 'lag_1', 'lag_2', 'lag_3', 'lag_4', 'lag_5', 'lag_6', 'lag_7', 'mav_7', 'mstd_7')
+
+# Set the date to next day and then loop to create the Next 3 months
+for (i in 1:90) {  # Predicting for the next 90 days
+  next_date <- max(next_three_months_data$Date) + 1  # Add one day
+  new_row <- data.frame(Date = next_date)
+  new_row$day <- as.numeric(format(new_row$Date, "%d"))
+  new_row$month <- as.numeric(format(new_row$Date, "%m"))
+  new_row$year <- as.numeric(format(new_row$Date, "%Y"))
+  new_row$day_of_week <- as.numeric(format(new_row$Date, "%w"))
+  new_row$week_of_year <- as.numeric(format(new_row$Date, "%U"))
+
+  # Update lagged features based on previous predictions
+  for (lag in 1:7) {
+    new_row[[paste0("lag_", lag)]] <- rolling_sales_list[length(rolling_sales_list) - lag + 1]
+  }
+
+  # Calculate moving value
+  new_row$mav_7 <- mean(tail(rolling_sales_list, 7))
+  new_row$mstd_7 <- sd(tail(rolling_sales_list, 7))
+  
+  # Convert the new_row to matrix format for prediction
+  new_row_matrix <- new_row[features]
+
+  # Predict the quantity using the final model
+  new_quantity <- predict(final_model, new_row_matrix)
+
+  # Append the predicted quantity to the Next 3 months DataFrame
+  new_row$quantity <- new_quantity
+  next_three_months_data <- rbind(next_three_months_data, new_row)
+  rolling_sales_list <- c(rolling_sales_list, new_quantity)
+}
+
+print(next_three_months_data)
+```
+
+```{r}
+library(ggplot2)
+
+# Combine historical data and predicted data
+combined_data <- rbind(
+  data.frame(Date = daily_sales$Date, quantity = daily_sales$quantity, Type = "Historical"), # Historical data with 'Type' column
+  data.frame(Date = next_three_months_data$Date, quantity = next_three_months_data$quantity, Type = "Forecasted") # Predicted data with 'Type' column
+)
+
+# Plot historical and predicted sales
+ggplot(combined_data, aes(x = Date, y = quantity, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Linear Regression - Daily Car Sales Quantity Prediction for Next 3 Months",
+    x = "Date",
+    y = "Total Sales Quantity",
+    color = "Type of Data",
+    linetype = "Type of Data"
+  ) +
+  scale_x_date(
+    date_labels = "%Y-%m", # Format as Year-Month
+    date_breaks = "1 month" # Show one tick per month
+  ) +
+  scale_color_manual(values = c("Historical" = "#83c5be", "Forecasted" = "#fb8500")) +
+  scale_linetype_manual(values = c("Historical" = "solid", "Forecasted" = "dashed")) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1) # Rotate x-axis labels for better readability
+  )
+```
+
+
+```{r}
+library(ggplot2)
+
+# Define the start and end dates for the x-axis
+start_date <- as.Date("2023-09-01")
+end_date <- as.Date("2024-03-31")
+
+# Combine historical data and predicted data
+combined_data <- rbind(
+  data.frame(Date = daily_sales$Date, quantity = daily_sales$quantity, Type = "Historical"), # Historical data with 'Type' column
+  data.frame(Date = next_three_months_data$Date, quantity = next_three_months_data$quantity, Type = "Forecasted") # Predicted data with 'Type' column
+)
+
+# Plot historical and predicted sales with limited x-axis range
+ggplot(combined_data, aes(x = Date, y = quantity, color = Type, linetype = Type)) +
+  geom_line(size = 1) +
+  labs(
+    title = "Linear Regression - Daily Car Sales Quantity Prediction for Next 3 Months",
+    x = "Date",
+    y = "Total Sales Quantity",
+    color = "Type of Data",
+    linetype = "Type of Data"
+  ) +
+  scale_x_date(
+    date_labels = "%b-%Y",  # Format as Month-Year (e.g., Sep-2023)
+    date_breaks = "1 month", # Show one tick per month
+    limits = c(start_date, end_date)  # Limit the x-axis range from Sep 2023 to Mar 2024
+  ) +
+  scale_color_manual(values = c("Historical" = "#83c5be", "Forecasted" = "#fb8500")) +
+  scale_linetype_manual(values = c("Historical" = "solid", "Forecasted" = "dashed")) +
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1) # Rotate x-axis labels for better readability
+  )
+```
+
+# ARIMA
+
+```{r}
+# Load necessary library
+library(stats)
+
+# ACF plot
+acf(daily_sales$quantity, main = "Autocorrelation Function (ACF)")
+
+# PACF plot
+pacf(daily_sales$quantity, main = "Partial Autocorrelation Function (PACF)")
+```
+
+```{r}
+# Load necessary libraries
+library(tseries)
+
+# Perform ADF test
+adf_test <- adf.test(daily_sales$quantity)
+
+# Print ADF Statistic and p-value
+cat("ADF Statistic:", adf_test$statistic, "\n")
+cat("p-value:", adf_test$p.value, "\n")
+
+# If p-value > 0.05, the data is non-stationary. Apply differencing.
+if (adf_test$p.value > 0.05) {
+  daily_sales$quantity_diff <- diff(daily_sales$quantity)  # Differencing the data
+} else {
+  daily_sales$quantity_diff <- daily_sales$quantity  # No differencing needed
+}
+
+```
+```{r}
+# Load necessary libraries
+library(forecast)
+
+# Select p, d, q with values from ACF/PACF plots
+p <- 1
+d <- 0
+q <- 11
+
+# Train-test split (80% training, 20% testing)
+train_size <- floor(length(daily_sales$quantity) * 0.8)
+train <- daily_sales$quantity[1:train_size]
+test <- daily_sales$quantity[(train_size + 1):length(daily_sales$quantity)]
+
+# Fit the ARIMA model
+model <- arima(train, order = c(p, d, q))
+
+# Print the summary of the fitted model
+summary(model)
+
+# Optionally, make predictions on the test set
+forecast_values <- forecast(model, h = length(test))
+
+# Print forecast
+print(forecast_values)
+
+```
+
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(forecast)
+
+# Residuals from the ARIMA model
+residuals <- residuals(model)
+
+# Histogram of residuals
+ggplot(data.frame(residuals), aes(x = residuals)) +
+  geom_histogram(aes(y = ..density..), bins = 30, fill = "lightblue", color = "black") +
+  geom_density(color = "red") +
+  ggtitle("Histogram of Residuals") +
+  xlab("Residuals") +
+  ylab("Density") +
+  theme_minimal()
+
+# Q-Q plot
+qqnorm(residuals)
+qqline(residuals, col = "red")
+
+# ACF of residuals
+acf(residuals, main = "ACF of Residuals", lag.max = 30)
+
+```
+
+```{r}
+# Load necessary libraries
+library(forecast)
+library(ggplot2)
+
+# Forecast on the test set using the fitted ARIMA model
+forecast_test <- forecast(model, h = length(test))
+preds <- forecast_test$mean
+
+
+# Create a data frame for plotting
+plot_data <- data.frame(
+  Time = daily_sales$Date[(train_size + 1):length(daily_sales$Date)], 
+  Actual = test,
+  Predicted = preds
+)
+
+# Plot Actual vs Predicted
+ggplot(plot_data) +
+  geom_line(aes(x = Time, y = Actual, color = "Actual"), size = 1) +
+  geom_line(aes(x = Time, y = Predicted, color = "Predicted"), linetype = "dashed", size = 1) +
+  ggtitle("ARIMA - Actual vs. Predicted Sales Quantity") +
+  xlab("Date") +
+  ylab("Total Sales Quantity") +
+  theme_minimal() +
+  scale_color_manual(
+    values = c("Actual" = "#CC6677", "Predicted" = "#88CCEE"),
+    name = "Type of Data"
+  ) +
+  scale_x_date(
+    date_labels = "%b %Y",  # Full month and year format (e.g., "Sep 2023")
+    date_breaks = "1 month"  # Show labels for every month
+  )
+
+# Evaluate error metrics
+mae <- mean(abs(test - preds))  # Mean Absolute Error
+rmse <- sqrt(mean((test - preds)^2))  # Root Mean Squared Error
+
+# Print the error metrics
+cat("Mean Absolute Error (MAE):", mae, "\n")
+cat("Root Mean Squared Error (RMSE):", rmse, "\n")
+
+```
+
+```{r}
+# Load necessary libraries
+library(forecast)
+library(ggplot2)
+
+# Define the number of days to forecast
+forecast_steps <- 90
+
+# Forecast the next 90 days using the fitted ARIMA model
+forecast_test <- forecast(model, h = forecast_steps)
+
+# Create future dates (next 90 days)
+last_date <- tail(daily_sales$Date, 1)  # Get the last date in the historical data
+future_dates <- seq(last_date + 1, by = "days", length.out = forecast_steps)
+
+# Create a data frame for the forecast
+forecast_df <- data.frame(
+  date = future_dates,
+  forecast_quantity = forecast_test$mean
+)
+
+# Plot historical data and forecast with legend
+ggplot() +
+  geom_line(data = daily_sales, aes(x = Date, y = quantity, color = "Historical"), size = 1, alpha = 0.7) +
+  geom_line(data = forecast_df, aes(x = date, y = forecast_quantity, color = "Forecasted"), linetype = "dashed", size = 1) +
+  ggtitle("ARIMA - Daily Car Sales Quantity Prediction for Next 3 Months") +
+  xlab("Date") +
+  ylab("Total Sales Quantity") +
+  theme_minimal() +
+  scale_x_date(
+    date_labels = "%b-%Y",  # Format x-axis labels to "Sep-2023"
+    date_breaks = "3 months"  # Set x-axis labels to appear every 3 months
+  ) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  # Rotate x-axis labels for better visibility
+  scale_color_manual(values = c("Historical" = "#CC6677", "Forecasted" = "#88CCEE")) +  # Set colors for legend
+  labs(color = "Type of Data")  # Add legend title
+
+# Display the plot
+print(ggplot)
+
+```
+
+```{r}
+# Load necessary libraries
+library(forecast)
+library(ggplot2)
+
+# Define the x-axis limits (Sep 2023 to Mar 2024)
+xlim_start <- as.Date("2023-09-01")
+xlim_end <- as.Date("2024-03-31")
+
+# Plot historical data and forecast with legend
+ggplot() +
+  # Plot the historical data
+  geom_line(data = daily_sales, aes(x = Date, y = quantity, color = "Historical"), size = 1, alpha = 0.7) +
+  
+  # Plot the forecast data
+  geom_line(data = forecast_df, aes(x = date, y = forecast_quantity, color = "Forecasted"), linetype = "dashed", size = 1) +
+  
+  # Add titles and labels
+  ggtitle("ARIMA - Daily Car Sales Quantity Prediction for Next 3 Months") +
+  xlab("Date") +
+  ylab("Total Sales Quantity") +
+  
+  # Apply minimal theme
+  theme_minimal() +
+  
+  # Customize the X-axis to show Month-Year
+  scale_x_date(
+    date_labels = "%b %Y",  # Display Month-Year format (e.g., Sep 2023)
+    date_breaks = "1 month",  # Show a tick for every month
+    limits = c(xlim_start, xlim_end)  # Limit the X-axis range
+  ) +
+  
+  # Rotate X-axis labels for better visibility
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  
+  # Add a custom color legend
+  scale_color_manual(
+    values = c("Historical" = "#CC6677", "Forecasted" = "#88CCEE"),  # Set colors
+    name = "Type of Data"  # Title for the legend
+  ) +
+  
+  # Add the legend title
+  labs(color = "Type of Data")
+
+# Display the plot
+
+
+```
+# Summary error
+
+```{r}
+# Create the DataFrame with updated values
+summary_df <- data.frame(
+  Model_Name = c('Linear Regression', 'XGBoost', 'ARIMA'),
+  RMSE = c(35.3178, 35.2002, 44.8481),
+  MAE = c(27.2444, 26.8811, 33.6613)
+)
+
+# Display the DataFrame
+print(summary_df)
+
+
+```
+
+# Descriptive Analytics
+
+```{r}
+# Load necessary libraries
+library(ggplot2)
+library(dplyr)
+library(scales)
+
+# Convert 'Date' to monthly period and calculate monthly sum of quantity
+daily_sales$Month <- format(daily_sales$Date, "%Y-%m-01")  # Convert 'Date' to month
+monthly_sum_quantity <- daily_sales %>%
+  group_by(Month) %>%
+  summarise(Sum_Quantity = sum(quantity))  # Monthly sum of quantities
+
+# Create a trendline using linear regression
+x <- 1:nrow(monthly_sum_quantity)  # Numeric values for months
+y <- monthly_sum_quantity$Sum_Quantity  # Total quantity sold
+trend <- lm(y ~ x)  # Linear regression model
+trendline <- predict(trend, newdata = data.frame(x = x))  # Get trendline values
+
+# Plotting the monthly sum quantity trend with the trendline and legend
+ggplot(monthly_sum_quantity, aes(x = as.Date(Month), y = Sum_Quantity)) +
+  geom_line(aes(color = "Total Sales Quantity"), size = 1, group = 1) +  # Map color to Total Quantity
+  geom_point(aes(color = "Total Sales Quantity"), size = 3) +  # Map color to Total Quantity
+  geom_line(aes(y = trendline, color = "Trendline"), linetype = "dashed", size = 1) +  # Map color to Trendline
+  ggtitle("Monthly Total Sales Quantity Trend") +
+  xlab("Months") +
+  ylab("Total Sales Quantity") +
+  scale_x_date(
+    date_labels = "%b-%Y",  # Set X-axis labels as Month-Year
+    date_breaks = "1 month"  # Show tick for every month
+  ) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +  # Rotate X-axis labels
+  scale_color_manual(
+    values = c("Total Sales Quantity" = "#3288BD", "Trendline" = "red"),  # Set custom colors
+    name = "Quantity Trend"  # Set legend title
+  ) +
+  labs(color = "Quantity Trend")  # Add legend title
+
+
+```
+
+
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(lubridate)
+
+# Add a 'Month' column to group by month
+daily_sales$Month <- month(daily_sales$Date, label = TRUE)
+
+# Aggregate sales by month
+monthly_sales <- daily_sales %>%
+  group_by(Month) %>%
+  summarise(monthly_total_sales = sum(quantity))
+
+# Calculate the average sales across all months
+average_monthly_sales <- mean(monthly_sales$monthly_total_sales)
+
+# Calculate the seasonal index for each month
+monthly_sales <- monthly_sales %>%
+  mutate(seasonal_index = monthly_total_sales / average_monthly_sales)
+
+# View the result
+print(monthly_sales)
+
+# Optional: Visualize the seasonal index
+library(ggplot2)
+ggplot(monthly_sales, aes(x = Month, y = seasonal_index)) +
+  geom_line(color = "#3288BD", size = 1, aes(group = 1)) + 
+  geom_point(color = "#3288BD", size = 3) + 
+  geom_hline(yintercept = 1, color = "#FDDA0D", linetype = "dashed", size = 1.5) + 
+  ggtitle("Seasonal Index by Month") +
+  xlab("Month") +
+  ylab("Seasonal Index") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(limits = c(0, NA))
+```
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(lubridate)
+
+car_sales_data$Month <- floor_date(car_sales_data$Date, "month")
+
+# Calculate the monthly sum of quantity grouped by Dealer_Region
+monthly_region_sum <- car_sales_data %>%
+  group_by(Month, Dealer_Region) %>%
+  summarise(quantity = n())
+
+# View the result
+head(monthly_region_sum)
+
+# Convert 'Month' to Date type if necessary
+monthly_region_sum$Month <- as.Date(monthly_region_sum$Month)
+
+# Unique dealer regions for creating subplots
+dealer_regions <- unique(monthly_region_sum$Dealer_Region)
+
+# Function to create the trendline (linear regression)
+create_trendline <- function(data) {
+  fit <- lm(quantity ~ as.numeric(Month), data = data)
+  trendline <- predict(fit, newdata = data)
+  data$trendline <- trendline
+  return(data)
+}
+
+# Apply the trendline function to each dealer region
+monthly_region_sum <- monthly_region_sum %>%
+  group_by(Dealer_Region) %>%
+  do(create_trendline(.))
+
+# Plotting with ggplot2
+ggplot(monthly_region_sum, aes(x = Month, y = quantity)) +
+  geom_line(color = '#3288BD', size = 1, aes(group = Dealer_Region)) + 
+  geom_line(aes(y = trendline), color = 'red', linetype = 'dashed', size = 1) +
+  facet_wrap(~ Dealer_Region, scales = 'free_y', ncol = 3) + # Facet by Dealer_Region
+  labs(title = 'Monthly Total Sales Quantity Trend by Dealer Region',
+       x = 'Month',
+       y = 'Total Sales Quantity') +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        strip.text = element_text(size = 10)) +
+  scale_y_continuous(labels = scales::comma) +
+  theme(strip.background = element_blank()) +
+  theme(panel.spacing = unit(1, "lines"))
+
+```
+
